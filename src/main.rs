@@ -1,114 +1,73 @@
-use serde::{Deserialize, Serialize};
-use serde_json;
 use std::{
-    ffi::OsStr,
+    collections::{HashMap, HashSet},
     fs::File,
-    io::{BufRead, BufReader, Read, Seek, Write},
-    path::Path,
+    io::{BufRead, BufReader},
+    time::Instant,
 };
+type DocumentId = String;
+type Term = String;
+type IndexType = HashMap<Term, HashSet<DocumentId>>;
+use serde::{Deserialize, Serialize};
 
-use zip::result::ZipError;
-
-/// Parametrul de tipul `impl Read + Seek` se numește "argument position impl trait" (APIT)
-/// o formulare echivalentă ar fi `fn list_zip_contents<T: Read + Seek>(reader: T)`
-/// `Read` și `Seek` sunt traits, care sunt oarecum similare cu interfețele din Java
-///   o diferență este că traiturile nu sunt declarate direct de structuri (cum e în java `class C implements I`),
-///   ci se pot declara separat: `impl Trait for Struct`
-/// de asemenea generics în Rust diferă de cele din Java prin faptul că sunt monomorfice,
-///   adică la compilare pentru o funcție generică se generează implementări separate pentru fiecare instanțiere cu argumente de tipuri diferite
-///   (asta le aseamănă mai mult cu templates din C++)
-/// https://doc.rust-lang.org/book/ch10-00-generics.html
-///
-/// deci practic lui `list_zip_contents` trebuie să-i dăm ca arugment o valoare al cărei tip implementează `Read` și `Seek`
-///   un exemplu e `std::fs::File` (ar mai fi de exemplu `std::io::Cursor` cu care putem folosi un buffer din memorie)
-fn get_names_list(reader: impl Read + Seek) -> Result<Vec<String>, ZipError> {
-    let mut zip = zip::ZipArchive::new(reader)?;
-    let mut file_names: Vec<String> = Vec::new();
-    for i in 0..zip.len() {
-        let file = zip.by_index(i)?;
-        file_names.push(file.name().to_string());
-        //println!("\tFilename: {}", file.name());
-    }
-
-    Ok(file_names)
-}
 #[derive(Debug, Serialize, Deserialize)]
-struct FileData {
+struct file_data {
     name: String,
-    file_names: Vec<String>,
-}
-/// La `Box<dyn std::error::Error>` vedem o altă utilizare a traiturilor, de data asta sub formă de "trait objects".
-/// Obiectele de tipul `dyn Trait` sunt un fel de pointeri polimorfici la structuri care implementează `Trait`.
-/// Din nou putem face o paralelă la Java sau C++, unde o variabilă de tipul `Error e` poate să referențieze o
-///   instanță a orcărei clase care implementează interfața (sau extinde clasa de bază) `Error`.
-///
-/// Valorile de typ `dyn Trait` trebuie mereu să fie în spatele unei referințe: `Box<dyn Trait>`, `&dyn Trait`, `&mut dyn Trait`, etc,
-///  asta e pentru că nu știm exact ce obiect e în spatele pointerului și ce size are (se zice că trait objects sunt `unsized types`)
-///
-/// https://doc.rust-lang.org/book/ch17-02-trait-objects.html
-///
-/// `Box<dyn std::error::Error>` e util ca tip de eroare fiindcă în principiu toate erorile în Rust implementează `std::error::Error`
-///   deci se pot converti implicit la `Box<dyn std::error::Error>` (ceea ce se întâmplă când folosim operatorul `?` de propagare).
-///
-///
-fn serialize_to<W: Write, T: ?Sized + Serialize>(
-    mut writer: W,
-    value: &T,
-) -> Result<(), std::io::Error> {
-    serde_json::to_writer(&mut writer, value)?;
-    writer.write_all(b"\n")
+    files: Vec<String>,
 }
 
-fn print_file_data(file_data: &FileData) {
-    let slice_string_in_json_format = serde_json::to_string(&file_data);
-    println!("{:?}", slice_string_in_json_format);
-}
-fn save_file_data(file_data: &FileData) {
-    let json_file = File::create(file_data.name.clone()).unwrap();
-    _ = serialize_to(json_file, &file_data);
-}
-fn read_json_file(file_name: String) -> Result<Vec<FileData>, Box<dyn std::error::Error>> {
-    let json_file_path = Path::new(&file_name);
-    let mut files_data: Vec<FileData> = Vec::new();
+fn load_data(data_filename: &str) -> Result<IndexType, Box<dyn std::error::Error>> {
+    let file = File::open(data_filename)?;
+    let reader = BufReader::new(file);
 
-    let file = File::open(json_file_path)?;
-    for line in BufReader::new(file).lines() {
-        let line = line.expect("couldn't get line");
-        let file_data: FileData = serde_json::from_str(&line).expect("couldn't deserialize");
-        files_data.push(file_data);
+    let mut data: Vec<file_data> = Vec::new();
+    for line in reader.lines().take(2) {
+        let line = line?;
+        let line = line.trim();
+        data.push(serde_json::from_str(line)?);
     }
-    Ok(files_data)
+
+    let mut indexes = IndexType::new();
+    for file_data in data.as_mut_slice() {
+        for file in file_data.files.as_mut_slice() {
+            let local_terms = file.split("/").map(String::from).collect::<Vec<_>>();
+            for term in local_terms {
+                indexes
+                    .entry(term.to_string())
+                    .and_modify(|t| {
+                        (*t).insert(file_data.name.to_string());
+                    })
+                    .or_insert(HashSet::from([file_data.name.to_string()]));
+            }
+        }
+    }
+    println! {"{:?}",indexes.len()}
+    Ok(indexes)
+}
+fn run_search(data: &IndexType, search: &Vec<&str>) {
+    let mut counter = HashMap::<DocumentId, u32>::new();
+    for term in search {
+        let app = data.get(*term);
+        for name in app.unwrap() {
+            counter
+                .entry(name.to_string())
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+        }
+    }
+    let maximum = search.len();
+    for file in counter {
+        println!("In file :{} found {}/{}", file.0, file.1, maximum)
+    }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    let dir = &args[1];
-    let mut zip_files: Vec<FileData> = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-        if path.is_file() && path.extension() == Some(OsStr::new("zip")) {
-            let file = File::open(&path)?;
-
-            let file_names = get_names_list(&file)?;
-            let data = FileData {
-                name: file_name.clone(),
-                file_names: file_names,
-            };
-            // save_file_data(&data);
-            // print_file_data(&data);
-            let read_data = read_json_file(file_name)?;
-            for file_data in read_data {
-                print_file_data(&file_data);
-            }
-
-            zip_files.push(data);
-            //println!("Contents of {:?}:", path);
-        } else {
-            println!("Skipping {:?}", path);
-        }
-    }
+    let data_filename = &args[1];
+    let start = Instant::now();
+    let data = load_data(&data_filename)?;
+    let search = Vec::from(["AndroidManifest.xml", "DebugProbesKt.bin"]);
+    run_search(&data, &search);
+    println!("Time elapsed {:?}", start.elapsed());
 
     Ok(())
 }
